@@ -1,107 +1,113 @@
-// ========================================================
-// Offline Realistic Female Voice TTS Server (Deno + Piper)
-// No external API, works fully offline
-// ========================================================
-//
-// Run with:
-// deno run --allow-net --allow-run --allow-read --allow-write server_tts.ts
-//
-// Usage:
-// http://localhost:8000/?text=Hello%20this%20is%20offline%20voice
-//
-// ========================================================
+// server.js — Bihar FM WebRTC Signaling + Metadata Relay
+const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const crypto = require("crypto");
 
-import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
+const app = express();
 
-// === CONFIG ===
-const PIPER_BIN = "./piper";                     // path to piper binary
-const MODEL = "./en_US-amy-low.onnx";            // female voice model file
-const TEMP_TEXT_FILE = "input.txt";
-const RAW_WAV = "voice_raw.wav";
-const FINAL_MP3 = "voice_final.mp3";
+// Root route check
+app.get("/", (req, res) => {
+  res.send("🎧 Bihar FM WebRTC Signaling Server is Live and Ready!");
+});
 
-// === UTIL ===
-async function generateVoice(text: string): Promise<Uint8Array | null> {
-  try {
-    // Save input text
-    await Deno.writeTextFile(TEMP_TEXT_FILE, text);
+// HTTP + WS server
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-    // 1️⃣ Run Piper (generate voice_raw.wav)
-    const piper = new Deno.Command(PIPER_BIN, {
-      args: [
-        "--model", MODEL,
-        "--output_file", RAW_WAV,
-        "--text_file", TEMP_TEXT_FILE,
-      ],
-    });
-    const piperResult = await piper.output();
+// Connected clients
+const clients = new Map(); // id -> { ws, role }
 
-    if (!piperResult.success) {
-      console.error("❌ Piper failed:\n", new TextDecoder().decode(piperResult.stderr));
-      return null;
+// Safe send helper
+function safeSend(ws, data) {
+  if (ws.readyState === ws.OPEN) {
+    try {
+      ws.send(JSON.stringify(data));
+    } catch (e) {
+      console.error("Send error:", e.message);
     }
-
-    // 2️⃣ Post-process using ffmpeg (volume + clarity)
-    const ffmpeg = new Deno.Command("ffmpeg", {
-      args: [
-        "-y",                     // overwrite output
-        "-i", RAW_WAV,            // input wav
-        "-filter:a",
-        // volume + light treble + subtle reverb for natural tone
-        "loudnorm,treble=g=3,aecho=0.8:0.9:100:0.3,volume=1.1",
-        "-ar", "44100",
-        "-ac", "2",
-        "-b:a", "192k",
-        FINAL_MP3,
-      ],
-      stderr: "piped",
-    });
-    const ffmpegResult = await ffmpeg.output();
-
-    if (!ffmpegResult.success) {
-      console.error("❌ ffmpeg failed:\n", new TextDecoder().decode(ffmpegResult.stderr));
-      return null;
-    }
-
-    // 3️⃣ Return MP3 data
-    const mp3 = await Deno.readFile(FINAL_MP3);
-    console.log("✅ Voice ready (" + text.slice(0, 40) + "...)");
-    return mp3;
-
-  } catch (err) {
-    console.error("Error in generateVoice:", err);
-    return null;
   }
 }
 
-// === SERVER ===
-serve(async (req) => {
-  try {
-    const url = new URL(req.url);
-    const text = url.searchParams.get("text");
+// Keep Render / Railway connections alive
+setInterval(() => {
+  for (const [, c] of clients)
+    if (c.ws.readyState === c.ws.OPEN)
+      safeSend(c.ws, { type: "ping" });
+}, 25000);
 
-    if (!text || text.trim().length === 0) {
-      return new Response("⚠️ Use /?text=Your+message", { status: 400 });
+// WebSocket handling
+wss.on("connection", (ws, req) => {
+  const id = crypto.randomUUID();
+  clients.set(id, { ws, role: null });
+  console.log("🔗 Connected:", id);
+
+  ws.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
     }
 
-    console.log("🎙️ Generating:", text);
+    const { type, role, target, payload } = msg;
 
-    const audio = await generateVoice(text);
-    if (!audio) {
-      return new Response("❌ TTS generation failed (see server log)", { status: 500 });
+    // Register as broadcaster or listener
+    if (type === "register") {
+      clients.get(id).role = role;
+      console.log(`🧩 ${id} registered as ${role}`);
+
+      // Notify broadcaster when listener joins
+      if (role === "listener") {
+        for (const [, c] of clients)
+          if (c.role === "broadcaster")
+            safeSend(c.ws, { type: "listener-joined", id });
+      }
+      return;
     }
 
-    return new Response(audio, {
-      headers: {
-        "Content-Type": "audio/mpeg",
-        "Cache-Control": "no-store",
-      },
-    });
-  } catch (err) {
-    console.error("Server error:", err);
-    return new Response("Internal Server Error", { status: 500 });
-  }
+    // Relay signaling messages
+    if (["offer", "answer", "candidate"].includes(type) && target) {
+      const t = clients.get(target);
+      if (t) safeSend(t.ws, { type, from: id, payload });
+      return;
+    }
+
+    // 🔴 Relay metadata to all listeners
+    if (type === "metadata") {
+      console.log(`🎵 Metadata update: ${payload?.title || "Unknown title"}`);
+      for (const [, c] of clients)
+        if (c.role === "listener")
+          safeSend(c.ws, {
+            type: "metadata",
+            title: payload.title,
+            artist: payload.artist,
+            cover: payload.cover,
+          });
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    const role = clients.get(id)?.role;
+    clients.delete(id);
+    console.log(`❌ ${role || "client"} disconnected: ${id}`);
+
+    // Notify broadcaster when listener leaves
+    if (role === "listener") {
+      for (const [, c] of clients)
+        if (c.role === "broadcaster")
+          safeSend(c.ws, { type: "peer-left", id });
+    }
+  });
+
+  ws.on("error", (err) => console.error("WebSocket error:", err.message));
 });
 
-console.log("\n🎧 Offline TTS server running on → http://localhost:8000/");
-console.log("👉 Try: http://localhost:8000/?text=Hello%20this%20is%20an%20offline%20female%20voice\n");
+// Keep-alive and headers timeout
+server.keepAliveTimeout = 70000;
+server.headersTimeout = 75000;
+
+// Start server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`✅ Bihar FM Server running on port ${PORT}`));
