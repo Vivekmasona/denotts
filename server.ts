@@ -1,84 +1,74 @@
-// server.js — Bihar FM WebRTC Signaling + Metadata Relay
-const express = require("express");
-const http = require("http");
-const { WebSocketServer } = require("ws");
-const crypto = require("crypto");
+// server.ts — Bihar FM Signaling + Metadata Server (Deno)
 
-const app = express();
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-// Root route check
-app.get("/", (req, res) => {
-  res.send("🎧 Bihar FM WebRTC Signaling Server is Live and Ready!");
-});
+// 🔐 Connected clients store
+const clients = new Map<string, { socket: WebSocket; role: string | null }>();
 
-// HTTP + WS server
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
-
-// Connected clients
-const clients = new Map(); // id -> { ws, role }
-
-// Safe send helper
-function safeSend(ws, data) {
-  if (ws.readyState === ws.OPEN) {
-    try {
-      ws.send(JSON.stringify(data));
-    } catch (e) {
-      console.error("Send error:", e.message);
-    }
+function safeSend(ws: WebSocket, data: unknown) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
   }
 }
 
-// Keep Render / Railway connections alive
+function uuid() {
+  return crypto.randomUUID();
+}
+
 setInterval(() => {
-  for (const [, c] of clients)
-    if (c.ws.readyState === c.ws.OPEN)
-      safeSend(c.ws, { type: "ping" });
+  for (const [, { socket }] of clients) {
+    safeSend(socket, { type: "ping" });
+  }
 }, 25000);
 
-// WebSocket handling
-wss.on("connection", (ws, req) => {
-  const id = crypto.randomUUID();
-  clients.set(id, { ws, role: null });
-  console.log("🔗 Connected:", id);
+console.log("🚀 Bihar FM Deno server starting...");
 
-  ws.on("message", (raw) => {
-    let msg;
+serve((req) => {
+  const { pathname } = new URL(req.url);
+
+  if (pathname === "/") {
+    return new Response("🎧 Bihar FM Deno WebRTC Signaling is Live!", {
+      headers: { "content-type": "text/plain" },
+    });
+  }
+
+  const { socket, response } = Deno.upgradeWebSocket(req);
+  const id = uuid();
+  clients.set(id, { socket, role: null });
+  console.log(`🔗 Connected: ${id}`);
+
+  socket.onmessage = (event) => {
+    let msg: any;
     try {
-      msg = JSON.parse(raw.toString());
+      msg = JSON.parse(event.data);
     } catch {
       return;
     }
 
     const { type, role, target, payload } = msg;
 
-    // Register as broadcaster or listener
     if (type === "register") {
-      clients.get(id).role = role;
+      clients.get(id)!.role = role;
       console.log(`🧩 ${id} registered as ${role}`);
-
-      // Notify broadcaster when listener joins
       if (role === "listener") {
         for (const [, c] of clients)
           if (c.role === "broadcaster")
-            safeSend(c.ws, { type: "listener-joined", id });
+            safeSend(c.socket, { type: "listener-joined", id });
       }
       return;
     }
 
-    // Relay signaling messages
     if (["offer", "answer", "candidate"].includes(type) && target) {
       const t = clients.get(target);
-      if (t) safeSend(t.ws, { type, from: id, payload });
+      if (t) safeSend(t.socket, { type, from: id, payload });
       return;
     }
 
-    // 🔴 Relay metadata to all listeners
     if (type === "metadata") {
-      console.log(`🎵 Metadata update: ${payload?.title || "Unknown title"}`);
+      console.log(`🎵 Metadata update: ${payload?.title || "Unknown"}`);
       for (const [, c] of clients)
         if (c.role === "listener")
-          safeSend(c.ws, {
+          safeSend(c.socket, {
             type: "metadata",
             title: payload.title,
             artist: payload.artist,
@@ -86,28 +76,20 @@ wss.on("connection", (ws, req) => {
           });
       return;
     }
-  });
+  };
 
-  ws.on("close", () => {
+  socket.onclose = () => {
     const role = clients.get(id)?.role;
     clients.delete(id);
     console.log(`❌ ${role || "client"} disconnected: ${id}`);
-
-    // Notify broadcaster when listener leaves
     if (role === "listener") {
       for (const [, c] of clients)
         if (c.role === "broadcaster")
-          safeSend(c.ws, { type: "peer-left", id });
+          safeSend(c.socket, { type: "peer-left", id });
     }
-  });
+  };
 
-  ws.on("error", (err) => console.error("WebSocket error:", err.message));
+  socket.onerror = (err) => console.error("WebSocket error:", err);
+
+  return response;
 });
-
-// Keep-alive and headers timeout
-server.keepAliveTimeout = 70000;
-server.headersTimeout = 75000;
-
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Bihar FM Server running on port ${PORT}`));
