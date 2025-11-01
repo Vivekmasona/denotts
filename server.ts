@@ -1,89 +1,42 @@
-// server.ts — Deno-safe YouTube playbackUrl fetcher (direct urls only)
+// main.ts — Deno YouTube Metadata Fetcher (no yt-dlp)
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-async function fetchPlayerResponse(videoId: string) {
-  const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-    headers: { "user-agent": "Mozilla/5.0 (DenoFetcher)" },
-  });
-  const html = await res.text();
-  const match = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
-  if (!match) throw new Error("No ytInitialPlayerResponse found");
-  return JSON.parse(match[1]);
-}
+async function fetchVideoData(videoId: string) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const html = await fetch(url).then((r) => r.text());
 
-function extractFormats(player: any) {
-  const all = [
-    ...(player.streamingData?.formats ?? []),
-    ...(player.streamingData?.adaptiveFormats ?? []),
-  ];
-  return all.map((f: any) => {
-    let playbackUrl: string | null = null;
+  const match = html.match(/ytInitialPlayerResponse\s*=\s*(\{.*?\});/s);
+  if (!match) return { error: "Player JSON not found" };
 
-    // Case 1: direct url
-    if (f.url) playbackUrl = f.url;
+  const data = JSON.parse(match[1]);
+  const streamingData = data.streamingData || {};
+  const formats = [...(streamingData.formats || []), ...(streamingData.adaptiveFormats || [])];
 
-    // Case 2: signatureCipher (skip for deploy safety)
-    if (!playbackUrl && f.signatureCipher) {
-      try {
-        const params = new URLSearchParams(f.signatureCipher);
-        const baseUrl = params.get("url");
-        // can't legally or safely decode signature here, so omit
-        playbackUrl = baseUrl ? baseUrl + "&signatureCipher=true" : null;
-      } catch {
-        playbackUrl = null;
-      }
-    }
+  const mapped = formats.map(f => ({
+    itag: f.itag,
+    mimeType: f.mimeType,
+    qualityLabel: f.qualityLabel || null,
+    bitrate: f.bitrate,
+    audioQuality: f.audioQuality || null,
+    audioSampleRate: f.audioSampleRate || null,
+    url: f.url || f.signatureCipher || null // ciphered URLs won't work directly
+  }));
 
-    return {
-      itag: f.itag,
-      mimeType: f.mimeType,
-      qualityLabel: f.qualityLabel,
-      bitrate: f.bitrate,
-      audioQuality: f.audioQuality,
-      width: f.width,
-      height: f.height,
-      fps: f.fps,
-      playbackUrl, // may be null if ciphered
-    };
-  });
+  return {
+    id: videoId,
+    title: data.videoDetails?.title,
+    author: data.videoDetails?.author,
+    lengthSeconds: data.videoDetails?.lengthSeconds,
+    formats: mapped
+  };
 }
 
 serve(async (req) => {
-  const url = new URL(req.url);
-  if (url.pathname === "/formats") {
-    const v = url.searchParams.get("v");
-    if (!v) {
-      return new Response(
-        JSON.stringify({ error: "missing ?v param" }),
-        { status: 400, headers: { "content-type": "application/json" } },
-      );
-    }
-
-    try {
-      const data = await fetchPlayerResponse(v);
-      const info = {
-        id: data.videoDetails?.videoId,
-        title: data.videoDetails?.title,
-        author: data.videoDetails?.author,
-        lengthSeconds: data.videoDetails?.lengthSeconds,
-        formats: extractFormats(data),
-      };
-      return new Response(JSON.stringify(info, null, 2), {
-        headers: { "content-type": "application/json" },
-      });
-    } catch (err) {
-      return new Response(
-        JSON.stringify({ error: err.message }),
-        { status: 500, headers: { "content-type": "application/json" } },
-      );
-    }
-  }
-
-  return new Response(
-    JSON.stringify({
-      info: "YouTube ytplayer.js extractor",
-      usage: "/formats?v=VIDEO_ID",
-    }, null, 2),
-    { headers: { "content-type": "application/json" } },
-  );
+  const { searchParams } = new URL(req.url);
+  const id = searchParams.get("v");
+  if (!id) return new Response("Missing ?v= parameter", { status: 400 });
+  const info = await fetchVideoData(id);
+  return new Response(JSON.stringify(info, null, 2), {
+    headers: { "content-type": "application/json" }
+  });
 });
